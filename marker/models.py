@@ -1,81 +1,68 @@
-import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1" # For some reason, transformers decided to use .isin for a simple op, which is not supported on MPS
+from surya.fast_layout import FastLayoutPredictor
+from surya.inference import SuryaInferenceManager
+from surya.layout import LayoutPredictor
+from surya.ocr_error import OCRErrorPredictor
+from surya.recognition import RecognitionPredictor
 
 
-from marker.postprocessors.editor import load_editing_model
-from surya.model.detection.model import load_model as load_detection_model, load_processor as load_detection_processor
-from texify.model.model import load_model as load_texify_model
-from texify.model.processor import load_processor as load_texify_processor
-from marker.settings import settings
-from surya.model.recognition.model import load_model as load_recognition_model
-from surya.model.recognition.processor import load_processor as load_recognition_processor
-from surya.model.ordering.model import load_model as load_order_model
-from surya.model.ordering.processor import load_processor as load_order_processor
+def create_model_dict(
+    device=None,
+    dtype=None,
+    attention_implementation: str | None = None,
+    inference_manager: SuryaInferenceManager | None = None,
+    inference_backend: str | None = None,
+) -> dict:
+    """Build the predictor set marker uses.
+
+    Two converter modes share this set:
+      - balanced (default): the VLM ``layout_model`` + full-page
+        ``recognition_model``.
+      - fast: the lightweight rf-detr ``fast_layout_model`` + block-mode OCR,
+        OCRing only garbled/empty content.
+
+    All the heavy models run in shared surya servers, so every predictor here is
+    a thin client and marker worker processes stay light (this is what lets many
+    workers share one GPU without each loading a model):
+      - ``layout_model`` / ``recognition_model``: clients of the VLM
+        ``inference_manager`` (lazy - only spawns a server when OCR is actually
+        needed, so clean digital docs in fast mode never start it).
+      - ``fast_layout_model``: a client of the shared fast-layout server (owns
+        the single rf-detr instance + continuous-batches across all clients).
+        Holds no model; spawns/attaches the server on first call, not here.
+      - ``ocr_error_model``: a client of the shared ocr-error server (the
+        DistilBert model runs in one server process; workers POST text to it).
+
+    Every predictor here is now a thin server client, so marker worker
+    processes hold NO models and many can share one GPU without each loading a
+    copy. Tables are reconstructed from the PDF text layer (pdftext heuristics)
+    for digital pages and from full-page OCR for scanned pages - there is no
+    dedicated table model. ``device``/``dtype``/``attention_implementation`` are
+    accepted for call-site compatibility (e.g. worker_init) but are now no-ops -
+    model devices are set server-side.
+    """
+    manager = inference_manager or SuryaInferenceManager(method=inference_backend)
+    return {
+        "inference_manager": manager,
+        "layout_model": LayoutPredictor(manager),
+        # Thin client of the shared fast-layout server (holds no model; the
+        # server owns the one rf-detr instance and continuous-batches across
+        # workers). Cheap to construct even in balanced mode, where it is never
+        # called. The reading-order head defaults off: pdftext pages are
+        # reordered from the PDF's character order (LineBuilder), so learned
+        # order is requested per call only for the pages that need it.
+        "fast_layout_model": FastLayoutPredictor(use_order=False),
+        "recognition_model": RecognitionPredictor(manager),
+        # Thin client of the shared ocr-error server (the DistilBert model runs
+        # in one server process; N marker workers just POST text to it). Holds
+        # no model, so it doesn't add per-worker GPU load. device/dtype/
+        # attention_implementation are server-side now and ignored here (kept in
+        # the signature for call-site compatibility, e.g. worker_init).
+        "ocr_error_model": OCRErrorPredictor(),
+    }
 
 
-def setup_recognition_model(langs, device=None, dtype=None):
-    if device:
-        rec_model = load_recognition_model(langs=langs, device=device, dtype=dtype)
-    else:
-        rec_model = load_recognition_model(langs=langs)
-    rec_processor = load_recognition_processor()
-    rec_model.processor = rec_processor
-    return rec_model
-
-
-def setup_detection_model(device=None, dtype=None):
-    if device:
-        model = load_detection_model(device=device, dtype=dtype)
-    else:
-        model = load_detection_model()
-
-    processor = load_detection_processor()
-    model.processor = processor
-    return model
-
-
-def setup_texify_model(device=None, dtype=None):
-    if device:
-        texify_model = load_texify_model(checkpoint=settings.TEXIFY_MODEL_NAME, device=device, dtype=dtype)
-    else:
-        texify_model = load_texify_model(checkpoint=settings.TEXIFY_MODEL_NAME, device=settings.TORCH_DEVICE_MODEL, dtype=settings.TEXIFY_DTYPE)
-    texify_processor = load_texify_processor()
-    texify_model.processor = texify_processor
-    return texify_model
-
-
-def setup_layout_model(device=None, dtype=None):
-    if device:
-        model = load_detection_model(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT, device=device, dtype=dtype)
-    else:
-        model = load_detection_model(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
-    processor = load_detection_processor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
-    model.processor = processor
-    return model
-
-
-def setup_order_model(device=None, dtype=None):
-    if device:
-        model = load_order_model(device=device, dtype=dtype)
-    else:
-        model = load_order_model()
-    processor = load_order_processor()
-    model.processor = processor
-    return model
-
-
-def load_all_models(langs=None, device=None, dtype=None, force_load_ocr=False):
-    if device is not None:
-        assert dtype is not None, "Must provide dtype if device is provided"
-
-    # langs is optional list of languages to prune from recognition MoE model
-    detection = setup_detection_model(device, dtype)
-    layout = setup_layout_model(device, dtype)
-    order = setup_order_model(device, dtype)
-    edit = load_editing_model(device, dtype)
-
-    # Only load recognition model if we'll need it for all pdfs
-    ocr = setup_recognition_model(langs, device, dtype)
-    texify = setup_texify_model(device, dtype)
-    model_lst = [texify, layout, order, edit, detection, ocr]
-    return model_lst
+def shutdown_models(model_dict: dict) -> None:
+    """Stop the shared inference server if this process spawned it."""
+    manager = model_dict.get("inference_manager")
+    if manager is not None:
+        manager.stop()
